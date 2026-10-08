@@ -1,0 +1,259 @@
+ponse.text();
+ }
+ 
++function packageNameFromLockPath(lockPath: string): string | undefined {
++	const marker = "node_modules/";
++	const index = lockPath.lastIndexOf(marker);
++	if (index === -1) return undefined;
++	const parts = lockPath.slice(index + marker.length).split("/");
++	if (parts[0]?.startsWith("@")) return parts[1] ? `${parts[0]}/${parts[1]}` : undefined;
++	return parts[0] || undefined;
++}
++
++function registryTarballUrl(packageName: string, version: string): string {
++	const tarballName = packageName.startsWith("@") ? packageName.split("/")[1] : packageName;
++	return `https://registry.npmjs.org/${packageName}/-/${tarballName}-${version}.tgz`;
++}
++
++function parseInstallerJson(content: string, label: string): Record<string, unknown> {
++	try {
++		const parsed = JSON.parse(content) as unknown;
++		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
++		return parsed as Record<string, unknown>;
++	} catch {
++		throw new Error(`Managed installer ${label} is not a valid JSON object.`);
++	}
++}
++
++/** Reject remote installer manifests that can change package identity or download hosts. */
++export function validateManagedInstallerArtifacts(
++	packageJsonContent: string,
++	packageLockContent: string,
++	expectedVersion: string,
++): void {
++	const packageJson = parseInstallerJson(packageJsonContent, "package.json");
++	const dependencies = packageJson.dependencies;
++	if (
++		packageJson.name !== MANAGED_INSTALL_PACKAGE_NAME ||
++		packageJson.version !== expectedVersion ||
++		typeof dependencies !== "object" ||
++		dependencies === null ||
++		Array.isArray(dependencies) ||
++		Object.keys(dependencies).length !== 1 ||
++		(dependencies as Record<string, unknown>)[PACKAGE_NAME] !== expectedVersion
++	) {
++		throw new Error("Managed installer package.json has an unexpected package identity or dependency set.");
++	}
++
++	const packageLock = parseInstallerJson(packageLockContent, "package-lock.json");
++	const packages = packageLock.packages;
++	if (
++		packageLock.name !== MANAGED_INSTALL_PACKAGE_NAME ||
++		packageLock.version !== expectedVersion ||
++		packageLock.lockfileVersion !== 3 ||
++		typeof packages !== "object" ||
++		packages === null ||
++		Array.isArray(packages)
++	) {
++		throw new Error("Managed installer package-lock.json has an unexpected root identity.");
++	}
++
++	const entries = packages as Record<string, unknown>;
++	const root = entries[""];
++	const piEntry = entries[`node_modules/${PACKAGE_NAME}`];
++	if (
++		typeof root !== "object" ||
++		root === null ||
++		Array.isArray(root) ||
++		(root as Record<string, unknown>).name !== MANAGED_INSTALL_PACKAGE_NAME ||
++		(root as Record<string, unknown>).version !== expectedVersion ||
++		typeof (root as Record<string, unknown>).dependencies !== "object" ||
++		(root as Record<string, unknown>).dependencies === null ||
++		((root as Record<string, unknown>).dependencies as Record<string, unknown>)[PACKAGE_NAME] !== expectedVersion ||
++		typeof piEntry !== "object" ||
++		piEntry === null ||
++		Array.isArray(piEntry) ||
++		(piEntry as Record<string, unknown>).version !== expectedVersion ||
++		(piEntry as Record<string, unknown>).resolved !== registryTarballUrl(PACKAGE_NAME, expectedVersion)
++	) {
++		throw new Error("Managed installer lockfile does not pin the expected Pi package.");
++	}
++
++	for (const [lockPath, rawEntry] of Object.entries(entries)) {
++		if (!lockPath || typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) continue;
++		const entry = rawEntry as Record<string, unknown>;
++		if (entry.resolved === undefined) continue;
++		const packageName = packageNameFromLockPath(lockPath);
++		if (!packageName || typeof entry.version !== "string" || typeof entry.resolved !== "string") {
++			throw new Error(`Managed installer lockfile contains an invalid package entry: ${lockPath}`);
++		}
++		if (entry.resolved !== registryTarballUrl(packageName, entry.version)) {
++			throw new Error(`Managed installer lockfile contains an untrusted package source: ${lockPath}`);
++		}
++	}
++}
++
+ async function runManagedNpmCi(stageDir: string): Promise<void> {
+ 	const args = [
+ 		"ci",
+@@ -228,6 +321,7 @@ async function runManagedSelfUpdate(managedRoot: string, version: string): Promi
+ 			fetchInstallerArtifact(`${releaseUrl}/package.json`, "package.json"),
+ 			fetchInstallerArtifact(`${releaseUrl}/package-lock.json`, "package-lock.json"),
+ 		]);
++		validateManagedInstallerArtifacts(packageJsonContent, packageLockContent, version);
+ 		writeFileSync(join(stageDir, "package.json"), packageJsonContent);
+ 		writeFileSync(join(stageDir, "package-lock.json"), packageLockContent);
+ 
+@@ -694,9 +788,9 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
+ 		throw new Error(`Could not determine latest ${APP_NAME} version.`);
+ 	}
+ 
+-	const packageName = latestRelease.packageName ?? PACKAGE_NAME;
+-	const installSpec = `${packageName}@${latestRelease.version}`;
+-	if (force || packageName !== PACKAGE_NAME || isNewerPackageVersion(latestRelease.version, VERSION)) {
++	const packageName = PACKAGE_NAME;
++	const installSpec = `${PACKAGE_NAME}@${latestRelease.version}`;
++	if (force || isNewerPackageVersion(latestRelease.version, VERSION)) {
+ 		return {
+ 			packageName,
+ 			installSpec,
+diff --git a/packages/coding-agent/src/utils/version-check.ts b/packages/coding-agent/src/utils/version-check.ts
+index a09a3d0..b0fe10d 100644
+--- a/packages/coding-agent/src/utils/version-check.ts
++++ b/packages/coding-agent/src/utils/version-check.ts
+@@ -7,7 +7,6 @@ const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
+ 
+ export interface LatestPiRelease {
+ 	version: string;
+-	packageName?: string;
+ 	note?: string;
+ }
+ 
+@@ -70,19 +69,15 @@ export async function getLatestPiRelease(
+ 	if (!response.ok) return undefined;
+ 
+ 	const data = (await response.json()) as {
+-		packageName?: unknown;
+ 		version?: unknown;
+ 		note?: unknown;
+ 	};
+-	if (typeof data.version !== "string" || !data.version.trim()) {
+-		return undefined;
+-	}
+-	const packageName =
+-		typeof data.packageName === "string" && data.packageName.trim() ? data.packageName.trim() : undefined;
++	if (typeof data.version !== "string") return undefined;
++	const version = valid(data.version.trim());
++	if (!version) return undefined;
+ 	const note = typeof data.note === "string" && data.note.trim() ? data.note.trim() : undefined;
+ 	return {
+-		version: data.version.trim(),
+-		packageName,
++		version,
+ 		...(note ? { note } : {}),
+ 	};
+ }
+diff --git a/packages/coding-agent/test/bug-report.test.ts b/packages/coding-agent/test/bug-report.test.ts
+index 4c2c67c..f607803 100644
+--- a/packages/coding-agent/test/bug-report.test.ts
++++ b/packages/coding-agent/test/bug-report.test.ts
+@@ -55,7 +55,6 @@ describe("bug report prompt", () => {
+ 			if (!(transcriptSelector instanceof ExtensionSelectorComponent))
+ 				throw new Error("Missing transcript selector");
+ 			expect(transcriptSelector.render(120).join("\n")).toContain("Include the session transcript?");
+-			transcriptSelector.handleInput("j");
+ 			transcriptSelector.handleInput("\r");
+ 			expect(editorContainer.children[0]).toBe(editor);
+ 
+@@ -63,7 +62,6 @@ describe("bug report prompt", () => {
+ 			const summarySelector = editorContainer.children[0];
+ 			if (!(summarySelector instanceof ExtensionSelectorComponent)) throw new Error("Missing summary selector");
+ 			expect(summarySelector.render(120).join("\n")).toContain("Attach a summary written by");
+-			summarySelector.handleInput("j");
+ 			summarySelector.handleInput("\r");
+ 			expect(editorContainer.children[0]).toBe(editor);
+ 
+@@ -74,6 +72,8 @@ describe("bug report prompt", () => {
+ 			expect(deliveryLines.some((line) => line.includes("Description: Request failed"))).toBe(true);
+ 			expect(deliveryLines.some((line) => line.includes("↳ pi exiting..."))).toBe(true);
+ 			expect(deliveryLines.some((line) => line.includes("stack trace"))).toBe(true);
++			expect(deliveryLines.some((line) => line.includes("Transcript: not included"))).toBe(true);
++			expect(deliveryLines.some((line) => line.includes("Summary: none"))).toBe(true);
+ 
+ 			deliverySelector.handleInput("j");
+ 			deliverySelector.handleInput("j");
+diff --git a/packages/coding-agent/test/first-time-setup.test.ts b/packages/coding-agent/test/first-time-setup.test.ts
+index c470e6d..16dfd62 100644
+--- a/packages/coding-agent/test/first-time-setup.test.ts
++++ b/packages/coding-agent/test/first-time-setup.test.ts
+@@ -56,6 +56,16 @@ describe("shouldRunFirstTimeSetup", () => {
+ 	});
+ });
+ 
++describe("install telemetry settings", () => {
++	it("defaults to disabled and remains available as an explicit opt-in", () => {
++		const manager = SettingsManager.inMemory();
++
++		expect(manager.getEnableInstallTelemetry()).toBe(false);
++		manager.setEnableInstallTelemetry(true);
++		expect(manager.getEnableInstallTelemetry()).toBe(true);
++	});
++});
++
+ describe("analytics settings", () => {
+ 	it("defaults to disabled with no tracking identifier", () => {
+ 		const manager = SettingsManager.inMemory();
+diff --git a/packages/coding-agent/test/package-command-paths.test.ts b/packages/coding-agent/test/package-command-paths.test.ts
+index c97fbe9..512666d 100644
+--- a/packages/coding-agent/test/package-command-paths.test.ts
++++ b/packages/coding-agent/test/package-command-paths.test.ts
+@@ -21,7 +21,7 @@ import { ProjectTrustStore } from "../src/core/trust-manager.ts";
+ import { main } from "../src/main.ts";
+ import { ConfigSelectorComponent } from "../src/modes/interactive/components/config-selector.ts";
+ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+-import { handlePackageCommand } from "../src/package-manager-cli.ts";
++import { handlePackageCommand, validateManagedInstallerArtifacts } from "../src/package-manager-cli.ts";
+ import { allowNetwork } from "./test-network-env.ts";
+ 
+ describe("package commands", () => {
+@@ -95,18 +95,42 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
+ 		return { managedRoot, npmRecordPath };
+ 	}
+ 
++	function managedInstallerArtifacts(targetVersion: string): { packageJson: object; packageLock: object } {
++		const installerName = "@earendil-works/pi-coding-agent-install";
++		const packageJson = {
++			name: installerName,
++			version: targetVersion,
++			private: true,
++			dependencies: { [PACKAGE_NAME]: targetVersion },
++		};
++		const packageLock = {
++			name: installerName,
++			version: targetVersion,
++			lockfileVersion: 3,
++			requires: true,
++			packages: {
++				"": { name: installerName, version: targetVersion, dependencies: { [PACKAGE_NAME]: targetVersion } },
++				[`node_modules/${PACKAGE_NAME}`]: {
++					version: targetVersion,
++					resolved: `https://registry.npmjs.org/${PACKAGE_NAME}/-/pi-coding-agent-${targetVersion}.tgz`,
++				},
++			},
++		};
++		return { packageJson, packageLock };
++	}
++
+ 	function mockManagedUpdate(targetVersion: string): void {
+ 		vi.stubGlobal(
+ 			"fetch",
+ 			vi.fn(async (input: string | URL | Request) => {
+ 				const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+ 				if (url === "https://pi.dev/api/latest-version") {
+-					return Response.json({ packageName: PACKAGE_NAME, version: targetVersion });
++					return Response.json({ packageName: "@attacker/pi", version: targetVersion });
+ 				}
+ 				const releaseUrl = `https://example.test/api/installer/releases/${targetVersion}`;
+-				if (url === `${releaseUrl}/package.json` || url === `${releaseUrl}/package-lock.json`) {
+-					return Response.json({});
+-		
