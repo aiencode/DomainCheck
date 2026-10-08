@@ -1,0 +1,162 @@
+@@ -75,9 +152,13 @@ export function withRemoteCatalog(
+ 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+ 		refreshModels: async (context) => {
+ 			const stored = context.stored;
+-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
++			const restored = hardenRemoteModels(
++				provider,
++				remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id),
++			);
+ 			if (
+ 				!(await context.publish({
++					...(stored ? { persist: { ...stored, models: restored } } : {}),
+ 					update: () => {
+ 						dynamicModels = restored;
+ 					},
+@@ -97,7 +178,7 @@ export function withRemoteCatalog(
+ 
+ 			// Only revalidate when a cached body backs the validator, so a 304 can never
+ 			// leave the overlay empty.
+-			const validator = stored && stored.models.length > 0 ? stored.etag : undefined;
++			const validator = stored && restored.length > 0 ? stored.etag : undefined;
+ 			const url = new URL(`/api/models/providers/${encodeURIComponent(provider.id)}`, catalogBaseUrl);
+ 			url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
+ 			const response = await fetchWithRetry(
+@@ -117,13 +198,14 @@ export function withRemoteCatalog(
+ 			// Unchanged: dynamicModels already holds the stored overlay, so only the
+ 			// freshness window moves.
+ 			if (response.status === 304 && stored) {
+-				await context.publish({ persist: { ...stored, checkedAt } });
++				await context.publish({ persist: { ...stored, models: restored, checkedAt } });
+ 				return;
+ 			}
+ 			if (response.status === 404 || response.status === 501) {
+ 				await context.publish({
+ 					persist: {
+ 						...(stored ?? { models: [] }),
++						models: restored,
+ 						checkedAt,
+ 						lastModified: 0,
+ 						etag: undefined,
+@@ -134,10 +216,10 @@ export function withRemoteCatalog(
+ 			if (!response.ok) {
+ 				// Transient failure: the cached body and its validator stay valid, so keep the
+ 				// etag and let the next refresh revalidate instead of downloading the catalog.
+-				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
++				await context.publish({ persist: { ...(stored ?? { models: [] }), models: restored, checkedAt } });
+ 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+ 			}
+-			const refreshed = parseCatalog(provider.id, await response.json());
++			const refreshed = hardenRemoteModels(provider, parseCatalog(provider.id, await response.json()));
+ 			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
+ 			if (context.signal.aborted) return;
+ 			const entry: ModelsStoreEntry = {
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index 2dd248e..c6e9846 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -152,7 +152,7 @@ export interface Settings {
+ 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
+ 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
+ 	collapseChangelog?: boolean; // Show condensed changelog after update (use /changelog for full)
+-	enableInstallTelemetry?: boolean; // default: true - anonymous version/update ping after changelog-detected updates
++	enableInstallTelemetry?: boolean; // default: false - opt-in anonymous version/update ping
+ 	enableAnalytics?: boolean; // default: false - opt-in analytics data sharing
+ 	trackingId?: string; // analytics tracking identifier, generated when analytics is enabled
+ 	deviceId?: string; // stable UUID of this installation, created when a login first needs it; global setting only
+@@ -1162,7 +1162,7 @@ export class SettingsManager {
+ 	}
+ 
+ 	getEnableInstallTelemetry(): boolean {
+-		return this.settings.enableInstallTelemetry ?? true;
++		return this.settings.enableInstallTelemetry ?? false;
+ 	}
+ 
+ 	setEnableInstallTelemetry(enabled: boolean): void {
+diff --git a/packages/coding-agent/src/core/slash-commands.ts b/packages/coding-agent/src/core/slash-commands.ts
+index 934de40..813c1d8 100644
+--- a/packages/coding-agent/src/core/slash-commands.ts
++++ b/packages/coding-agent/src/core/slash-commands.ts
+@@ -24,7 +24,11 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+ 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
+ 	{ name: "export", description: "Export session (HTML default, or specify path: .html/.jsonl)" },
+ 	{ name: "import", description: "Import and resume a session from a JSONL file" },
+-	{ name: "share", description: "Share session as a secret GitHub gist" },
++	{
++		name: "share",
++		description: "Share as a private GitHub gist; Radius requires an explicit argument",
++		argumentHint: "[gist|radius]",
++	},
+ 	{ name: "bug", description: "Report a bug to the Pi developers", argumentHint: "<description>" },
+ 	{ name: "copy", description: "Copy last agent message to clipboard" },
+ 	{ name: "name", description: "Set session display name" },
+diff --git a/packages/coding-agent/src/modes/interactive/bug-report.ts b/packages/coding-agent/src/modes/interactive/bug-report.ts
+index 51034e0..0eff3ba 100644
+--- a/packages/coding-agent/src/modes/interactive/bug-report.ts
++++ b/packages/coding-agent/src/modes/interactive/bug-report.ts
+@@ -113,7 +113,7 @@ async function promptForOptions(
+ 	const transcript = await choose(
+ 		context,
+ 		"Include the session transcript?",
+-		["Yes, include the transcript", "No"],
++		["No", "Yes, include the transcript"],
+ 		TRANSCRIPT_NOTE,
+ 	);
+ 	if (!transcript) return undefined;
+@@ -124,7 +124,7 @@ async function promptForOptions(
+ 		const summary = await choose(
+ 			context,
+ 			`Attach a summary written by ${model?.name ?? "the current model"} instead?`,
+-			["Yes, generate a summary", "No"],
++			["No", "Yes, generate a summary"],
+ 			`The transcript is sent to ${model?.provider ?? "your provider"} with your credentials and tokens. Only the generated summary is attached; the transcript stays on your machine.`,
+ 		);
+ 		if (!summary) return undefined;
+@@ -134,7 +134,7 @@ async function promptForOptions(
+ 	const delivery = await choose(
+ 		context,
+ 		"Bug report",
+-		["Upload Report", "Export as Zip", "Cancel"],
++		["Export as Zip", "Upload Report", "Cancel"],
+ 		`Description: ${description || "none"}\nTranscript: ${includeSession ? "included" : "not included"}\nSummary: ${includeSummary ? `written by ${context.session.model?.name ?? "the current model"}` : "none"}\n\nUpload sends the report to ${new URL(getRadiusGatewayUrl()).host}. Export writes a zip archive to the current directory instead.`,
+ 	);
+ 	if (!delivery || delivery === "Cancel") return undefined;
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 55ea404..60f31a0 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -3234,8 +3234,9 @@ export class InteractiveMode {
+ 				this.editor.setText("");
+ 				return;
+ 			}
+-			if (text === "/share") {
+-				await this.handleShareCommand();
++			if (text === "/share" || text.startsWith("/share ")) {
++				const target = text.slice("/share".length).trim();
++				await this.handleShareCommand(target || "gist");
+ 				this.editor.setText("");
+ 				return;
+ 			}
+@@ -6608,7 +6609,11 @@ export class InteractiveMode {
+ 		}
+ 	}
+ 
+-	private async handleShareCommand(): Promise<void> {
++	private async handleShareCommand(target: string): Promise<void> {
++		if (target !== "gist" && target !== "radius") {
++			this.showError("Usage: /share [gist|radius]. Radius uploads the full session to the configured Radius server.");
++			return;
++		}
+ 		await shareSession({
+ 			session: this.session,
+ 			ui: this.ui,
+@@ -6616,7 +6621,7 @@ export class InteractiveMode {
+ 			editor: this.editor,
+ 			showStatus: (message) => this.showStatus(message),
+ 			showError: (message) => this.showError(message),
+-		});
++		}, target);
+ 	}
+ 
+ 	private async handleBugCommand(hint: string | undefined): Promise<void> {
+diff --git a/packages/coding-agent/src/modes/interactive/session-share.ts b/packages/coding-agent/src/modes/interactive/session-share.ts
