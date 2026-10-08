@@ -1,0 +1,17 @@
+name: Pi build runner test
+
+on:
+  push:
+    branches:
+      - build/pi-1.1.0-hardened-linux-x64
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          uname -a
+          test "$(uname -m)" = x86_64
