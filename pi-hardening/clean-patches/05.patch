@@ -1,0 +1,222 @@
++	return withRemoteCatalog(provider, "https://pi.dev", localGeneratedAt);
+ }
+ 
+ async function refreshProvider(
+@@ -130,13 +164,20 @@ describe("remote catalog provider", () => {
+ 					{ status: 200, headers: { "content-type": "application/json" } },
+ 				),
+ 		);
+-		const provider = testProvider();
++		const provider = testProvider(undefined, true);
+ 		const store = new InMemoryModelsStore();
+ 		await refreshProvider(provider, store);
+ 
+ 		const models = createModels({ modelsStore: store });
+ 		models.setProvider(provider);
+-		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "chat", "flux", "jev"]);
++		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual([
++			"static",
++			"image-template",
++			"classifier-template",
++			"chat",
++			"flux",
++			"jev",
++		]);
+ 		expect(models.getModelOfType("image", "test-provider", "flux")?.type).toBe("image");
+ 		expect(models.getModelOfType("classifier", "test-provider", "jev")?.type).toBe("classifier");
+ 		expect(models.getModel("test-provider", "flux")).toBeUndefined();
+@@ -144,6 +185,109 @@ describe("remote catalog provider", () => {
+ 		expect(stored?.models.map((entry) => entry.id)).toEqual(["chat", "flux", "jev"]);
+ 	});
+ 
++	it("keeps built-in routes and authentication metadata when a remote catalog redefines an existing model", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				static: {
++					...model("static"),
++					name: "Updated display name",
++					contextWindow: 2000,
++					api: "anthropic-messages",
++					baseUrl: "https://radius.pi.dev/v1",
++					headers: { Authorization: "Bearer stolen" },
++					compat: { supportsStrictTools: true },
++				},
++			}),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		const updated = provider.getModels().find((entry) => entry.id === "static");
++		expect(updated).toMatchObject({
++			name: "Updated display name",
++			contextWindow: 2000,
++			api: "openai-completions",
++			baseUrl: "https://example.test/v1",
++		});
++		expect(updated?.headers).toBeUndefined();
++		expect(updated?.compat).toBeUndefined();
++		expect((await store.read(provider.id))?.models).toEqual([updated]);
++	});
++
++	it("drops an existing model ID when the remote catalog changes its model type", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				static: { ...imageModel("static"), baseUrl: "https://example.test/v1" },
++			}),
++		);
++		const provider = testProvider(undefined, true);
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getAllModels?.().filter((entry) => entry.id === "static")).toEqual([model("static")]);
++		expect((await store.read(provider.id))?.models).toEqual([]);
++	});
++
++	it("drops new models whose route is not already trusted for the provider", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				redirected: { ...model("redirected"), baseUrl: "https://radius.pi.dev/v1" },
++			}),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
++		expect((await store.read(provider.id))?.models).toEqual([]);
++	});
++
++	it("sanitizes cached catalogs before restoring them in offline mode", async () => {
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await store.write(provider.id, {
++			models: [
++				{
++					...model("static"),
++					name: "Cached metadata",
++					baseUrl: "https://radius.pi.dev/v1",
++					headers: { Authorization: "Bearer stolen" },
++				},
++				{ ...model("redirected"), baseUrl: "https://radius.pi.dev/v1" },
++			] as AnyModel[],
++			checkedAt: Date.now(),
++			lastModified: Date.now(),
++		});
++
++		await refreshProvider(provider, store, { allowNetwork: false });
++
++		const restored = provider.getModels().find((entry) => entry.id === "static");
++		expect(restored).toMatchObject({
++			name: "Cached metadata",
++			baseUrl: "https://example.test/v1",
++			api: "openai-completions",
++		});
++		expect(restored?.headers).toBeUndefined();
++		expect(provider.getModels().some((entry) => entry.id === "redirected")).toBe(false);
++		expect((await store.read(provider.id))?.models).toEqual([restored]);
++	});
++
++	it("allows new model IDs on a route explicitly defined by the local provider", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({ custom: { ...model("custom"), name: "Custom model" } }),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getModels().find((entry) => entry.id === "custom")).toMatchObject({
++			name: "Custom model",
++			baseUrl: "https://example.test/v1",
++			api: "openai-completions",
++		});
++	});
++
+ 	it("prefers the newer of the generated and remote catalogs", async () => {
+ 		const localGeneratedAt = Date.parse("2026-07-23T10:00:00.000Z");
+ 		const newerHeader = new Date(localGeneratedAt + 60_000).toUTCString();
+diff --git a/packages/coding-agent/test/session-share.test.ts b/packages/coding-agent/test/session-share.test.ts
+index 3c1bf52..bb04b0e 100644
+--- a/packages/coding-agent/test/session-share.test.ts
++++ b/packages/coding-agent/test/session-share.test.ts
+@@ -1,7 +1,7 @@
+ import { EventEmitter } from "node:events";
+ import { readFileSync, writeFileSync } from "node:fs";
+ import { PassThrough } from "node:stream";
+-import { beforeAll, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ const childProcessMocks = vi.hoisted(() => ({
+ 	spawn: vi.fn(),
+@@ -23,6 +23,11 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
+ 
+ describe("shareSession", () => {
+ 	beforeAll(() => initTheme("dark"));
++	beforeEach(() => {
++		vi.clearAllMocks();
++		childProcessMocks.spawnSync.mockReturnValue({ status: 0 });
++	});
++	afterEach(() => vi.unstubAllGlobals());
+ 
+ 	it("keeps concurrent session exports isolated", async () => {
+ 		const uploads: string[] = [];
+@@ -85,4 +90,84 @@ describe("shareSession", () => {
+ 		expect(uploads).toEqual(["A", "B"]);
+ 		expect(errors).toEqual([]);
+ 	});
++
++	it("does not contact Radius merely because Radius credentials exist", async () => {
++		const getAuth = vi.fn(async () => ({ auth: { apiKey: "radius-token" } }));
++		const fetchMock = vi.fn();
++		vi.stubGlobal("fetch", fetchMock);
++		childProcessMocks.spawn.mockImplementation((_command, args: string[]) => {
++			expect(readFileSync(args.at(-1)!, "utf8")).toBe("gist");
++			const child = Object.assign(new EventEmitter(), {
++				stdout: new PassThrough(),
++				stderr: new PassThrough(),
++				kill: vi.fn(),
++			});
++			queueMicrotask(() => {
++				child.stdout.end("https://gist.github.com/test/default\n");
++				child.stderr.end();
++				child.emit("close", 0);
++			});
++			return child;
++		});
++		const statuses: string[] = [];
++		const context = {
++			session: {
++				sessionManager: { getSessionId: () => "gist", getCwd: () => "/tmp", getBranch: () => [] },
++				state: { systemPrompt: "secret", tools: [] },
++				modelRuntime: { getProvider: () => ({}), getAuth },
++				exportToHtml: async (filePath: string) => writeFileSync(filePath, "gist"),
++			},
++			ui: { setFocus() {}, requestRender() {} },
++			editorContainer: { clear() {}, addChild() {} },
++			editor: {},
++			showStatus(message: string) {
++				statuses.push(message);
++			},
++			showError: vi.fn(),
++		};
++
++		await shareSession(context as never);
++
++		expect(getAuth).not.toHaveBeenCalled();
++		expect(fetchMock).not.toHaveBeenCalled();
++		expect(statuses.join("\n")).toContain("gist.github.com");
++	});
++
++	it("uploads to Radius only when Radius is explicitly selected", async () => {
++		const fetchMock = vi.fn(async () =>
++			Response.json({ artifact: { canonical_url: "https://radius.pi.dev/artifacts/explicit" } }),
++		);
++		vi.stubGlobal("fetch", fetchMock);
++		const statuses: string[] = [];
++		const errors: string[] = [];
++		const context = {
++			session: {
++				sessionManager: { getSessionId: () => "radius", getCwd: () => "/tmp", getBranch: () => [] },
++				state: { systemPrompt: "explicit session", tools: [] },
++				modelRuntime: {
++					getProvider: () => ({}),
