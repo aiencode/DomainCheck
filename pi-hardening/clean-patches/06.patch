@@ -1,0 +1,62 @@
++					getAuth: async () => ({ auth: { apiKey: "radius-token" } }),
++				},
++			},
++			ui: { setFocus() {}, requestRender() {} },
++			editorContainer: { clear() {}, addChild() {} },
++			editor: {},
++			showStatus(message: string) {
++				statuses.push(message);
++			},
++			showError(message: string) {
++				errors.push(message);
++			},
++		};
++
++		await shareSession(context as never, "radius");
++
++		expect(fetchMock).toHaveBeenCalledOnce();
++		const [input, init] = fetchMock.mock.calls[0]!;
++		expect(String(input)).toContain("radius.pi.dev/v1/artifacts");
++		expect(init?.headers).toMatchObject({ Authorization: "Bearer radius-token" });
++		expect(String(init?.body)).toContain("explicit session");
++		expect(statuses.join("\n")).toContain("/artifacts/explicit");
++		expect(errors).toEqual([]);
++	});
+ });
+diff --git a/packages/coding-agent/test/version-check.test.ts b/packages/coding-agent/test/version-check.test.ts
+index ffe2150..84945ae 100644
+--- a/packages/coding-agent/test/version-check.test.ts
++++ b/packages/coding-agent/test/version-check.test.ts
+@@ -89,21 +89,29 @@ describe("version checks", () => {
+ 		expect(formatVersionCheckError(error)).toBe("fetch failed (ETIMEDOUT, ENETUNREACH)");
+ 	});
+ 
+-	it("returns the active package metadata from the version check api", async () => {
++	it("ignores package identity supplied by the version check api", async () => {
+ 		const fetchMock = vi.fn(async () =>
+ 			Response.json({
+-				packageName: "@new-scope/pi",
++				packageName: "@attacker/pi",
+ 				version: "1.2.4",
+ 			}),
+ 		);
+ 		vi.stubGlobal("fetch", fetchMock);
+ 
+ 		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+-			packageName: "@new-scope/pi",
+ 			version: "1.2.4",
+ 		});
+ 	});
+ 
++	it("rejects non-semver versions from the version check api", async () => {
++		const fetchMock = vi.fn(async () =>
++			Response.json({ version: "npm:@attacker/pi@1.0.0" }),
++		);
++		vi.stubGlobal("fetch", fetchMock);
++
++		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
++	});
++
+ 	it("returns update notes from the version check api", async () => {
+ 		const fetchMock = vi.fn(async () => Response.json({ note: " **Read this** ", version: "1.2.4" }));
+ 		vi.stubGlobal("fetch", fetchMock);
