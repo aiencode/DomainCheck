@@ -1,0 +1,217 @@
+ 			vi.fn(async (input: string | URL | Request) => {
+ 				const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+ 				if (url === "https://pi.dev/api/latest-version") {
+-					return Response.json({ packageName: PACKAGE_NAME, version: targetVersion });
++					return Response.json({ packageName: "@attacker/pi", version: targetVersion });
+ 				}
+ 				const releaseUrl = `https://example.test/api/installer/releases/${targetVersion}`;
+-				if (url === `${releaseUrl}/package.json` || url === `${releaseUrl}/package-lock.json`) {
+-					return Response.json({});
+-				}
++				const artifacts = managedInstallerArtifacts(targetVersion);
++				if (url === `${releaseUrl}/package.json`) return Response.json(artifacts.packageJson);
++				if (url === `${releaseUrl}/package-lock.json`) return Response.json(artifacts.packageLock);
+ 				throw new Error(`Unexpected fetch: ${url}`);
+ 			}),
+ 		);
+@@ -668,6 +692,47 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
+ 		}
+ 	});
+ 
++	it("accepts a managed installer that pins Pi to the official npm registry", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(artifacts.packageJson),
++				JSON.stringify(artifacts.packageLock),
++				targetVersion,
++			),
++		).not.toThrow();
++	});
++
++	it("rejects a managed installer that changes the package identity", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		const packageJson = { ...artifacts.packageJson, dependencies: { "@attacker/pi": targetVersion } };
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(packageJson),
++				JSON.stringify(artifacts.packageLock),
++				targetVersion,
++			),
++		).toThrow(/unexpected package identity/i);
++	});
++
++	it("rejects a managed installer that redirects a package tarball", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		const packageLock = structuredClone(artifacts.packageLock) as {
++			packages: Record<string, { resolved?: string }>;
++		};
++		packageLock.packages[`node_modules/${PACKAGE_NAME}`]!.resolved = "https://radius.pi.dev/attacker.tgz";
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(artifacts.packageJson),
++				JSON.stringify(packageLock),
++				targetVersion,
++			),
++		).toThrow(/does not pin the expected Pi package|untrusted package source/i);
++	});
++
+ 	it("updates installer-managed Pi through a staged immutable release", async () => {
+ 		const targetVersion = getNewerPatchVersion();
+ 		const { managedRoot, npmRecordPath } = prepareManagedInstall(targetVersion);
+@@ -881,7 +946,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
+ 		}
+ 	});
+ 
+-	it("installs the active package name from the update check during self-update", async () => {
++	it("ignores a remote package name during self-update", async () => {
+ 		const globalPrefix = join(tempDir, "global-prefix");
+ 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
+ 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
+@@ -907,10 +972,11 @@ else {
+ 			value: join(selfPackageDir, "dist", "cli.js"),
+ 			configurable: true,
+ 		});
+-		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
++		const activePackageName = "@attacker/pi";
++		const targetVersion = getNewerPatchVersion();
+ 		vi.stubGlobal(
+ 			"fetch",
+-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
++			vi.fn(async () => Response.json({ packageName: activePackageName, version: targetVersion })),
+ 		);
+ 
+ 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+@@ -923,9 +989,9 @@ else {
+ 			expect(errorSpy).not.toHaveBeenCalled();
+ 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
+ 			expect(recordedCalls).toEqual([
+-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+-				expect.arrayContaining(["install", "-g", `${activePackageName}@0.73.0`]),
++				expect.arrayContaining(["install", "-g", `${PACKAGE_NAME}@${targetVersion}`]),
+ 			]);
++			expect(recordedCalls.flat()).not.toContain(activePackageName);
+ 		} finally {
+ 			logSpy.mockRestore();
+ 			errorSpy.mockRestore();
+@@ -976,7 +1042,7 @@ else {
+ 		}
+ 	});
+ 
+-	it("fails self-update when renamed npm package installation fails", async () => {
++	it("keeps the fixed package identity when npm installation fails", async () => {
+ 		const globalPrefix = join(tempDir, "global-prefix");
+ 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
+ 		const fakeNpmPath = join(tempDir, "fake-npm-fail.cjs");
+@@ -1004,10 +1070,11 @@ if(args.includes("install")) process.exit(23);
+ 			value: join(selfPackageDir, "dist", "cli.js"),
+ 			configurable: true,
+ 		});
+-		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
++		const activePackageName = "@attacker/pi";
++		const targetVersion = getNewerPatchVersion();
+ 		vi.stubGlobal(
+ 			"fetch",
+-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
++			vi.fn(async () => Response.json({ packageName: activePackageName, version: targetVersion })),
+ 		);
+ 
+ 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+@@ -1023,9 +1090,9 @@ if(args.includes("install")) process.exit(23);
+ 			expect(stderr).toContain("exited with code 23");
+ 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
+ 			expect(recordedCalls).toEqual([
+-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+-				expect.arrayContaining(["install", "-g", `${activePackageName}@0.73.0`]),
++				expect.arrayContaining(["install", "-g", `${PACKAGE_NAME}@${targetVersion}`]),
+ 			]);
++			expect(recordedCalls.flat()).not.toContain(activePackageName);
+ 		} finally {
+ 			logSpy.mockRestore();
+ 			errorSpy.mockRestore();
+diff --git a/packages/coding-agent/test/remote-catalog-provider.test.ts b/packages/coding-agent/test/remote-catalog-provider.test.ts
+index b79bc79..08f0a25 100644
+--- a/packages/coding-agent/test/remote-catalog-provider.test.ts
++++ b/packages/coding-agent/test/remote-catalog-provider.test.ts
+@@ -2,6 +2,9 @@ import {
+ 	createModels,
+ 	createProvider,
+ 	InMemoryModelsStore,
++	type AnyModel,
++	type ClassifierModel,
++	type ImageModel,
+ 	type Model,
+ 	type ModelsPublication,
+ 	type Provider,
+@@ -28,24 +31,55 @@ function model(id: string): Model<"openai-completions"> {
+ 	};
+ }
+ 
+-function testProvider(localGeneratedAt?: number) {
+-	return withRemoteCatalog(
+-		createProvider({
+-			id: "test-provider",
+-			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+-			models: [model("static")],
+-			api: {
+-				stream: () => {
+-					throw new Error("not used");
+-				},
+-				streamSimple: () => {
+-					throw new Error("not used");
+-				},
++function imageModel(id: string): ImageModel<"openrouter-images"> {
++	return {
++		type: "image",
++		id,
++		name: id,
++		api: "openrouter-images",
++		provider: "test-provider",
++		baseUrl: "https://example.test/v1",
++		input: ["text"],
++		output: ["image"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	};
++}
++
++function classifierModel(id: string): ClassifierModel<"typesafe-system-one"> {
++	return {
++		type: "classifier",
++		id,
++		name: id,
++		api: "typesafe-system-one",
++		provider: "test-provider",
++		baseUrl: "https://example.test/v1",
++		input: ["text"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++		contextWindow: 64000,
++	};
++}
++
++function testProvider(localGeneratedAt?: number, includeAllTypes = false) {
++	const base = createProvider({
++		id: "test-provider",
++		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
++		models: [model("static")],
++		api: {
++			stream: () => {
++				throw new Error("not used");
+ 			},
+-		}),
+-		"https://pi.dev",
+-		localGeneratedAt,
+-	);
++			streamSimple: () => {
++				throw new Error("not used");
++			},
++		},
++	});
++	const provider = includeAllTypes
++		? ({
++				...base,
++				getAllModels: () => [model("static"), imageModel("image-template"), classifierModel("classifier-template")],
++			}) as Provider
++		: base;
