@@ -1,0 +1,306 @@
+			}
++				const artifacts = managedInstallerArtifacts(targetVersion);
++				if (url === `${releaseUrl}/package.json`) return Response.json(artifacts.packageJson);
++				if (url === `${releaseUrl}/package-lock.json`) return Response.json(artifacts.packageLock);
+ 				throw new Error(`Unexpected fetch: ${url}`);
+ 			}),
+ 		);
+@@ -668,6 +692,47 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
+ 		}
+ 	});
+ 
++	it("accepts a managed installer that pins Pi to the official npm registry", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(artifacts.packageJson),
++				JSON.stringify(artifacts.packageLock),
++				targetVersion,
++			),
++		).not.toThrow();
++	});
++
++	it("rejects a managed installer that changes the package identity", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		const packageJson = { ...artifacts.packageJson, dependencies: { "@attacker/pi": targetVersion } };
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(packageJson),
++				JSON.stringify(artifacts.packageLock),
++				targetVersion,
++			),
++		).toThrow(/unexpected package identity/i);
++	});
++
++	it("rejects a managed installer that redirects a package tarball", () => {
++		const targetVersion = getNewerPatchVersion();
++		const artifacts = managedInstallerArtifacts(targetVersion);
++		const packageLock = structuredClone(artifacts.packageLock) as {
++			packages: Record<string, { resolved?: string }>;
++		};
++		packageLock.packages[`node_modules/${PACKAGE_NAME}`]!.resolved = "https://radius.pi.dev/attacker.tgz";
++		expect(() =>
++			validateManagedInstallerArtifacts(
++				JSON.stringify(artifacts.packageJson),
++				JSON.stringify(packageLock),
++				targetVersion,
++			),
++		).toThrow(/does not pin the expected Pi package|untrusted package source/i);
++	});
++
+ 	it("updates installer-managed Pi through a staged immutable release", async () => {
+ 		const targetVersion = getNewerPatchVersion();
+ 		const { managedRoot, npmRecordPath } = prepareManagedInstall(targetVersion);
+@@ -881,7 +946,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
+ 		}
+ 	});
+ 
+-	it("installs the active package name from the update check during self-update", async () => {
++	it("ignores a remote package name during self-update", async () => {
+ 		const globalPrefix = join(tempDir, "global-prefix");
+ 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
+ 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
+@@ -907,10 +972,11 @@ else {
+ 			value: join(selfPackageDir, "dist", "cli.js"),
+ 			configurable: true,
+ 		});
+-		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
++		const activePackageName = "@attacker/pi";
++		const targetVersion = getNewerPatchVersion();
+ 		vi.stubGlobal(
+ 			"fetch",
+-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
++			vi.fn(async () => Response.json({ packageName: activePackageName, version: targetVersion })),
+ 		);
+ 
+ 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+@@ -923,9 +989,9 @@ else {
+ 			expect(errorSpy).not.toHaveBeenCalled();
+ 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
+ 			expect(recordedCalls).toEqual([
+-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+-				expect.arrayContaining(["install", "-g", `${activePackageName}@0.73.0`]),
++				expect.arrayContaining(["install", "-g", `${PACKAGE_NAME}@${targetVersion}`]),
+ 			]);
++			expect(recordedCalls.flat()).not.toContain(activePackageName);
+ 		} finally {
+ 			logSpy.mockRestore();
+ 			errorSpy.mockRestore();
+@@ -976,7 +1042,7 @@ else {
+ 		}
+ 	});
+ 
+-	it("fails self-update when renamed npm package installation fails", async () => {
++	it("keeps the fixed package identity when npm installation fails", async () => {
+ 		const globalPrefix = join(tempDir, "global-prefix");
+ 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
+ 		const fakeNpmPath = join(tempDir, "fake-npm-fail.cjs");
+@@ -1004,10 +1070,11 @@ if(args.includes("install")) process.exit(23);
+ 			value: join(selfPackageDir, "dist", "cli.js"),
+ 			configurable: true,
+ 		});
+-		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
++		const activePackageName = "@attacker/pi";
++		const targetVersion = getNewerPatchVersion();
+ 		vi.stubGlobal(
+ 			"fetch",
+-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
++			vi.fn(async () => Response.json({ packageName: activePackageName, version: targetVersion })),
+ 		);
+ 
+ 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+@@ -1023,9 +1090,9 @@ if(args.includes("install")) process.exit(23);
+ 			expect(stderr).toContain("exited with code 23");
+ 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
+ 			expect(recordedCalls).toEqual([
+-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+-				expect.arrayContaining(["install", "-g", `${activePackageName}@0.73.0`]),
++				expect.arrayContaining(["install", "-g", `${PACKAGE_NAME}@${targetVersion}`]),
+ 			]);
++			expect(recordedCalls.flat()).not.toContain(activePackageName);
+ 		} finally {
+ 			logSpy.mockRestore();
+ 			errorSpy.mockRestore();
+diff --git a/packages/coding-agent/test/remote-catalog-provider.test.ts b/packages/coding-agent/test/remote-catalog-provider.test.ts
+index b79bc79..08f0a25 100644
+--- a/packages/coding-agent/test/remote-catalog-provider.test.ts
++++ b/packages/coding-agent/test/remote-catalog-provider.test.ts
+@@ -2,6 +2,9 @@ import {
+ 	createModels,
+ 	createProvider,
+ 	InMemoryModelsStore,
++	type AnyModel,
++	type ClassifierModel,
++	type ImageModel,
+ 	type Model,
+ 	type ModelsPublication,
+ 	type Provider,
+@@ -28,24 +31,55 @@ function model(id: string): Model<"openai-completions"> {
+ 	};
+ }
+ 
+-function testProvider(localGeneratedAt?: number) {
+-	return withRemoteCatalog(
+-		createProvider({
+-			id: "test-provider",
+-			auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
+-			models: [model("static")],
+-			api: {
+-				stream: () => {
+-					throw new Error("not used");
+-				},
+-				streamSimple: () => {
+-					throw new Error("not used");
+-				},
++
++function imageModel(id: string): ImageModel<"openrouter-images"> {
++	return {
++		type: "image",
++		id,
++		name: id,
++		api: "openrouter-images",
++		provider: "test-provider",
++		baseUrl: "https://example.test/v1",
++		input: ["text"],
++		output: ["image"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	};
++}
++
++function classifierModel(id: string): ClassifierModel<"typesafe-system-one"> {
++	return {
++		type: "classifier",
++		id,
++		name: id,
++		api: "typesafe-system-one",
++		provider: "test-provider",
++		baseUrl: "https://example.test/v1",
++		input: ["text"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++		contextWindow: 64000,
++	};
++}
++
++function testProvider(localGeneratedAt?: number, includeAllTypes = false) {
++	const base = createProvider({
++		id: "test-provider",
++		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
++		models: [model("static")],
++		api: {
++			stream: () => {
++				throw new Error("not used");
+ 			},
+-		}),
+-		"https://pi.dev",
+-		localGeneratedAt,
+-	);
++			streamSimple: () => {
++				throw new Error("not used");
++			},
++		},
++	});
++	const provider = includeAllTypes
++		? ({
++				...base,
++				getAllModels: () => [model("static"), imageModel("image-template"), classifierModel("classifier-template")],
++			}) as Provider
++		: base;
++	return withRemoteCatalog(provider, "https://pi.dev", localGeneratedAt);
+ }
+ 
+ async function refreshProvider(
+@@ -130,13 +164,20 @@ describe("remote catalog provider", () => {
+ 					{ status: 200, headers: { "content-type": "application/json" } },
+ 				),
+ 		);
+-		const provider = testProvider();
++		const provider = testProvider(undefined, true);
+ 		const store = new InMemoryModelsStore();
+ 		await refreshProvider(provider, store);
+ 
+ 		const models = createModels({ modelsStore: store });
+ 		models.setProvider(provider);
+-		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "chat", "flux", "jev"]);
++		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual([
++			"static",
++			"image-template",
++			"classifier-template",
++			"chat",
++			"flux",
++			"jev",
++		]);
+ 		expect(models.getModelOfType("image", "test-provider", "flux")?.type).toBe("image");
+ 		expect(models.getModelOfType("classifier", "test-provider", "jev")?.type).toBe("classifier");
+ 		expect(models.getModel("test-provider", "flux")).toBeUndefined();
+@@ -144,6 +185,109 @@ describe("remote catalog provider", () => {
+ 		expect(stored?.models.map((entry) => entry.id)).toEqual(["chat", "flux", "jev"]);
+ 	});
+ 
++	it("keeps built-in routes and authentication metadata when a remote catalog redefines an existing model", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				static: {
++					...model("static"),
++					name: "Updated display name",
++					contextWindow: 2000,
++					api: "anthropic-messages",
++					baseUrl: "https://radius.pi.dev/v1",
++					headers: { Authorization: "Bearer stolen" },
++					compat: { supportsStrictTools: true },
++				},
++			}),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		const updated = provider.getModels().find((entry) => entry.id === "static");
++		expect(updated).toMatchObject({
++			name: "Updated display name",
++			contextWindow: 2000,
++			api: "openai-completions",
++			baseUrl: "https://example.test/v1",
++		});
++		expect(updated?.headers).toBeUndefined();
++		expect(updated?.compat).toBeUndefined();
++		expect((await store.read(provider.id))?.models).toEqual([updated]);
++	});
++
++	it("drops an existing model ID when the remote catalog changes its model type", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				static: { ...imageModel("static"), baseUrl: "https://example.test/v1" },
++			}),
++		);
++		const provider = testProvider(undefined, true);
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getAllModels?.().filter((entry) => entry.id === "static")).toEqual([model("static")]);
++		expect((await store.read(provider.id))?.models).toEqual([]);
++	});
++
++	it("drops new models whose route is not already trusted for the provider", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({
++				redirected: { ...model("redirected"), baseUrl: "https://radius.pi.dev/v1" },
++			}),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
++		expect((await store.read(provider.id))?.models).toEqual([]);
++	});
++
++	it("sanitizes cached catalogs before restoring them in offline mode", async () => {
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await store.write(provider.id, {
++			models: [
++				{
++					...model("static"),
++					
