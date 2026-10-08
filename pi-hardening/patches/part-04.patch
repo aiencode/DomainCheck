@@ -1,0 +1,188 @@
+name: "Cached metadata",
++					baseUrl: "https://radius.pi.dev/v1",
++					headers: { Authorization: "Bearer stolen" },
++				},
++				{ ...model("redirected"), baseUrl: "https://radius.pi.dev/v1" },
++			] as AnyModel[],
++			checkedAt: Date.now(),
++			lastModified: Date.now(),
++		});
++
++		await refreshProvider(provider, store, { allowNetwork: false });
++
++		const restored = provider.getModels().find((entry) => entry.id === "static");
++		expect(restored).toMatchObject({
++			name: "Cached metadata",
++			baseUrl: "https://example.test/v1",
++			api: "openai-completions",
++		});
++		expect(restored?.headers).toBeUndefined();
++		expect(provider.getModels().some((entry) => entry.id === "redirected")).toBe(false);
++		expect((await store.read(provider.id))?.models).toEqual([restored]);
++	});
++
++	it("allows new model IDs on a route explicitly defined by the local provider", async () => {
++		vi.spyOn(globalThis, "fetch").mockResolvedValue(
++			Response.json({ custom: { ...model("custom"), name: "Custom model" } }),
++		);
++		const provider = testProvider();
++		const store = new InMemoryModelsStore();
++		await refreshProvider(provider, store);
++
++		expect(provider.getModels().find((entry) => entry.id === "custom")).toMatchObject({
++			name: "Custom model",
++			baseUrl: "https://example.test/v1",
++			api: "openai-completions",
++		});
++	});
++
+ 	it("prefers the newer of the generated and remote catalogs", async () => {
+ 		const localGeneratedAt = Date.parse("2026-07-23T10:00:00.000Z");
+ 		const newerHeader = new Date(localGeneratedAt + 60_000).toUTCString();
+diff --git a/packages/coding-agent/test/session-share.test.ts b/packages/coding-agent/test/session-share.test.ts
+index 3c1bf52..bb04b0e 100644
+--- a/packages/coding-agent/test/session-share.test.ts
++++ b/packages/coding-agent/test/session-share.test.ts
+@@ -1,7 +1,7 @@
+ import { EventEmitter } from "node:events";
+ import { readFileSync, writeFileSync } from "node:fs";
+ import { PassThrough } from "node:stream";
+-import { beforeAll, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ const childProcessMocks = vi.hoisted(() => ({
+ 	spawn: vi.fn(),
+@@ -23,6 +23,11 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
+ 
+ describe("shareSession", () => {
+ 	beforeAll(() => initTheme("dark"));
++	beforeEach(() => {
++		vi.clearAllMocks();
++		childProcessMocks.spawnSync.mockReturnValue({ status: 0 });
++	});
++	afterEach(() => vi.unstubAllGlobals());
+ 
+ 	it("keeps concurrent session exports isolated", async () => {
+ 		const uploads: string[] = [];
+@@ -85,4 +90,84 @@ describe("shareSession", () => {
+ 		expect(uploads).toEqual(["A", "B"]);
+ 		expect(errors).toEqual([]);
+ 	});
++
++	it("does not contact Radius merely because Radius credentials exist", async () => {
++		const getAuth = vi.fn(async () => ({ auth: { apiKey: "radius-token" } }));
++		const fetchMock = vi.fn();
++		vi.stubGlobal("fetch", fetchMock);
++		childProcessMocks.spawn.mockImplementation((_command, args: string[]) => {
++			expect(readFileSync(args.at(-1)!, "utf8")).toBe("gist");
++			const child = Object.assign(new EventEmitter(), {
++				stdout: new PassThrough(),
++				stderr: new PassThrough(),
++				kill: vi.fn(),
++			});
++			queueMicrotask(() => {
++				child.stdout.end("https://gist.github.com/test/default\n");
++				child.stderr.end();
++				child.emit("close", 0);
++			});
++			return child;
++		});
++		const statuses: string[] = [];
++		const context = {
++			session: {
++				sessionManager: { getSessionId: () => "gist", getCwd: () => "/tmp", getBranch: () => [] },
++				state: { systemPrompt: "secret", tools: [] },
++				modelRuntime: { getProvider: () => ({}), getAuth },
++				exportToHtml: async (filePath: string) => writeFileSync(filePath, "gist"),
++			},
++			ui: { setFocus() {}, requestRender() {} },
++			editorContainer: { clear() {}, addChild() {} },
++			editor: {},
++			showStatus(message: string) {
++				statuses.push(message);
++			},
++			showError: vi.fn(),
++		};
++
++		await shareSession(context as never);
++
++		expect(getAuth).not.toHaveBeenCalled();
++		expect(fetchMock).not.toHaveBeenCalled();
++		expect(statuses.join("\n")).toContain("gist.github.com");
++	});
++
++	it("uploads to Radius only when Radius is explicitly selected", async () => {
++		const fetchMock = vi.fn(async () =>
++			Response.json({ artifact: { canonical_url: "https://radius.pi.dev/artifacts/explicit" } }),
++		);
++		vi.stubGlobal("fetch", fetchMock);
++		const statuses: string[] = [];
++		const errors: string[] = [];
++		const context = {
++			session: {
++				sessionManager: { getSessionId: () => "radius", getCwd: () => "/tmp", getBranch: () => [] },
++				state: { systemPrompt: "explicit session", tools: [] },
++				modelRuntime: {
++					getProvider: () => ({}),
++					getAuth: async () => ({ auth: { apiKey: "radius-token" } }),
++				},
++			},
++			ui: { setFocus() {}, requestRender() {} },
++			editorContainer: { clear() {}, addChild() {} },
++			editor: {},
++			showStatus(message: string) {
++				statuses.push(message);
++			},
++			showError(message: string) {
++				errors.push(message);
++			},
++		};
++
++		await shareSession(context as never, "radius");
++
++		expect(fetchMock).toHaveBeenCalledOnce();
++		const [input, init] = fetchMock.mock.calls[0]!;
++		expect(String(input)).toContain("radius.pi.dev/v1/artifacts");
++		expect(init?.headers).toMatchObject({ Authorization: "Bearer radius-token" });
++		expect(String(init?.body)).toContain("explicit session");
++		expect(statuses.join("\n")).toContain("/artifacts/explicit");
++		expect(errors).toEqual([]);
++	});
+ });
+diff --git a/packages/coding-agent/test/version-check.test.ts b/packages/coding-agent/test/version-check.test.ts
+index ffe2150..84945ae 100644
+--- a/packages/coding-agent/test/version-check.test.ts
++++ b/packages/coding-agent/test/version-check.test.ts
+@@ -89,21 +89,29 @@ describe("version checks", () => {
+ 		expect(formatVersionCheckError(error)).toBe("fetch failed (ETIMEDOUT, ENETUNREACH)");
+ 	});
+ 
+-	it("returns the active package metadata from the version check api", async () => {
++	it("ignores package identity supplied by the version check api", async () => {
+ 		const fetchMock = vi.fn(async () =>
+ 			Response.json({
+-				packageName: "@new-scope/pi",
++				packageName: "@attacker/pi",
+ 				version: "1.2.4",
+ 			}),
+ 		);
+ 		vi.stubGlobal("fetch", fetchMock);
+ 
+ 		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+-			packageName: "@new-scope/pi",
+ 			version: "1.2.4",
+ 		});
+ 	});
+ 
++	it("rejects non-semver versions from the version check api", async () => {
++		const fetchMock = vi.fn(async () =>
++			Response.json({ version: "npm:@attacker/pi@1.0.0" }),
++		);
++		vi.stubGlobal("fetch", fetchMock);
++
++		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
++	});
++
+ 	it("returns update notes from the version check api", async () => {
+ 		const fetchMock = vi.fn(async () => Response.json({ note: " **Read this** ", version: "1.2.4" }));
+ 		vi.stubGlobal("fetch", fetchMock);
